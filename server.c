@@ -225,43 +225,80 @@ int main(int argc, char *argv[]) {
 #elif defined(USE_KQUEUE)
                 int client_fd = fd;
 #endif
-                int done = 0;
+                int close_conn = 0;
+                int requests_handled = 0;
 
+                /* Handle multiple pipelined requests in edge-triggered mode */
                 while (1) {
                     ssize_t count = recv(client_fd, buffer, sizeof(buffer), 0);
 
                     if (count == -1) {
-                        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                            done = 1;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            /* No more data available, keep connection alive */
+                            break;
+                        } else {
+                            /* Real error, close connection */
+                            close_conn = 1;
+                            break;
                         }
-                        break;
                     } else if (count == 0) {
-                        done = 1;
+                        /* Client closed connection */
+                        close_conn = 1;
                         break;
                     }
 
-                    /* Send response immediately */
-                    if (count >= 4) {
-                        ssize_t sent = 0;
-                        while (sent < response_len) {
+                    /* Parse HTTP request - look for end of headers */
+                    char *end_of_headers = NULL;
+                    for (ssize_t j = 0; j < count - 3; j++) {
+                        if (buffer[j] == '\r' && buffer[j+1] == '\n' &&
+                            buffer[j+2] == '\r' && buffer[j+3] == '\n') {
+                            end_of_headers = buffer + j + 4;
+                            break;
+                        }
+                    }
+
+                    if (end_of_headers) {
+                        /* Send response */
+                        ssize_t total_sent = 0;
+                        while (total_sent < response_len) {
 #ifdef USE_EPOLL
-                            ssize_t n = send(client_fd, response + sent, response_len - sent, MSG_NOSIGNAL);
+                            ssize_t n = send(client_fd, response + total_sent,
+                                           response_len - total_sent, MSG_NOSIGNAL);
 #elif defined(USE_KQUEUE)
-                            ssize_t n = send(client_fd, response + sent, response_len - sent, 0);
+                            ssize_t n = send(client_fd, response + total_sent,
+                                           response_len - total_sent, 0);
 #endif
                             if (n == -1) {
                                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                                    done = 1;
+                                    close_conn = 1;
                                 }
                                 break;
                             }
-                            sent += n;
+                            total_sent += n;
                         }
+
+                        requests_handled++;
+
+                        /* Check if there's more data after this request (pipelining) */
+                        ssize_t remaining = count - (end_of_headers - buffer);
+                        if (remaining > 0) {
+                            /* More data in buffer, might be next request */
+                            continue;
+                        }
+
+                        /* Continue to read more requests on this connection */
+                        if (!close_conn && requests_handled < 1000) {
+                            continue;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        /* Incomplete request, will get more data on next event */
                         break;
                     }
                 }
 
-                if (done) {
+                if (close_conn) {
 #ifdef USE_EPOLL
                     epoll_ctl(event_fd, EPOLL_CTL_DEL, client_fd, NULL);
 #elif defined(USE_KQUEUE)
