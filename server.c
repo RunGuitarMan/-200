@@ -5,9 +5,19 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/socket.h>
-#include <sys/epoll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+
+/* Platform-specific event handling */
+#ifdef __linux__
+    #include <sys/epoll.h>
+    #define USE_EPOLL 1
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+    #include <sys/event.h>
+    #define USE_KQUEUE 1
+#else
+    #error "Unsupported platform - need epoll (Linux) or kqueue (BSD/macOS)"
+#endif
 
 #define PORT 8080
 #define BACKLOG 2048
@@ -51,9 +61,8 @@ static void configure_socket(int fd) {
 }
 
 int main(int argc, char *argv[]) {
-    int server_fd, epoll_fd;
+    int server_fd, event_fd;
     struct sockaddr_in address;
-    struct epoll_event ev, events[MAX_EVENTS];
     int opt = 1;
     int port = PORT;
 
@@ -107,29 +116,54 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+#ifdef USE_EPOLL
     /* Create epoll instance */
-    epoll_fd = epoll_create1(0);
-    if (epoll_fd == -1) {
+    struct epoll_event ev, events[MAX_EVENTS];
+    event_fd = epoll_create1(0);
+    if (event_fd == -1) {
         perror("epoll_create1");
         exit(EXIT_FAILURE);
     }
 
     /* Add server socket to epoll */
-    ev.events = EPOLLIN | EPOLLET; /* Edge-triggered for performance */
+    ev.events = EPOLLIN | EPOLLET;
     ev.data.fd = server_fd;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) == -1) {
+    if (epoll_ctl(event_fd, EPOLL_CTL_ADD, server_fd, &ev) == -1) {
         perror("epoll_ctl: server_fd");
         exit(EXIT_FAILURE);
     }
 
     printf("High-performance web server listening on port %d\n", port);
-    printf("Using epoll with edge-triggered mode\n");
+    printf("Using epoll (Linux)\n");
+
+#elif defined(USE_KQUEUE)
+    /* Create kqueue instance */
+    struct kevent events[MAX_EVENTS];
+    struct kevent change;
+    event_fd = kqueue();
+    if (event_fd == -1) {
+        perror("kqueue");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Add server socket to kqueue */
+    EV_SET(&change, server_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    if (kevent(event_fd, &change, 1, NULL, 0, NULL) == -1) {
+        perror("kevent: server_fd");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("High-performance web server listening on port %d\n", port);
+    printf("Using kqueue (macOS/BSD)\n");
+#endif
+
     printf("Press Ctrl+C to stop\n");
 
     /* Event loop */
     char buffer[BUFFER_SIZE];
     while (1) {
-        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+#ifdef USE_EPOLL
+        int nfds = epoll_wait(event_fd, events, MAX_EVENTS, -1);
         if (nfds == -1) {
             perror("epoll_wait");
             exit(EXIT_FAILURE);
@@ -137,6 +171,17 @@ int main(int argc, char *argv[]) {
 
         for (int i = 0; i < nfds; i++) {
             if (events[i].data.fd == server_fd) {
+#elif defined(USE_KQUEUE)
+        int nfds = kevent(event_fd, NULL, 0, events, MAX_EVENTS, NULL);
+        if (nfds == -1) {
+            perror("kevent");
+            exit(EXIT_FAILURE);
+        }
+
+        for (int i = 0; i < nfds; i++) {
+            int fd = (int)events[i].ident;
+            if (fd == server_fd) {
+#endif
                 /* Accept new connections */
                 while (1) {
                     struct sockaddr_in client_addr;
@@ -145,7 +190,6 @@ int main(int argc, char *argv[]) {
 
                     if (client_fd == -1) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            /* All connections processed */
                             break;
                         } else {
                             perror("accept");
@@ -157,17 +201,30 @@ int main(int argc, char *argv[]) {
                     set_nonblocking(client_fd);
                     configure_socket(client_fd);
 
+#ifdef USE_EPOLL
                     /* Add to epoll */
                     ev.events = EPOLLIN | EPOLLET;
                     ev.data.fd = client_fd;
-                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) == -1) {
+                    if (epoll_ctl(event_fd, EPOLL_CTL_ADD, client_fd, &ev) == -1) {
                         perror("epoll_ctl: client_fd");
                         close(client_fd);
                     }
+#elif defined(USE_KQUEUE)
+                    /* Add to kqueue */
+                    EV_SET(&change, client_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+                    if (kevent(event_fd, &change, 1, NULL, 0, NULL) == -1) {
+                        perror("kevent: client_fd");
+                        close(client_fd);
+                    }
+#endif
                 }
             } else {
                 /* Handle client data */
+#ifdef USE_EPOLL
                 int client_fd = events[i].data.fd;
+#elif defined(USE_KQUEUE)
+                int client_fd = fd;
+#endif
                 int done = 0;
 
                 while (1) {
@@ -175,22 +232,23 @@ int main(int argc, char *argv[]) {
 
                     if (count == -1) {
                         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                            perror("recv");
                             done = 1;
                         }
                         break;
                     } else if (count == 0) {
-                        /* Client closed connection */
                         done = 1;
                         break;
                     }
 
-                    /* Check if we have a complete HTTP request (look for \r\n\r\n) */
+                    /* Send response immediately */
                     if (count >= 4) {
-                        /* Send response */
                         ssize_t sent = 0;
                         while (sent < response_len) {
+#ifdef USE_EPOLL
                             ssize_t n = send(client_fd, response + sent, response_len - sent, MSG_NOSIGNAL);
+#elif defined(USE_KQUEUE)
+                            ssize_t n = send(client_fd, response + sent, response_len - sent, 0);
+#endif
                             if (n == -1) {
                                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
                                     done = 1;
@@ -199,12 +257,17 @@ int main(int argc, char *argv[]) {
                             }
                             sent += n;
                         }
-                        break; /* Request handled */
+                        break;
                     }
                 }
 
                 if (done) {
-                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
+#ifdef USE_EPOLL
+                    epoll_ctl(event_fd, EPOLL_CTL_DEL, client_fd, NULL);
+#elif defined(USE_KQUEUE)
+                    EV_SET(&change, client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+                    kevent(event_fd, &change, 1, NULL, 0, NULL);
+#endif
                     close(client_fd);
                 }
             }
