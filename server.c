@@ -54,6 +54,11 @@ static void configure_socket(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
 
+    /* Prevent SIGPIPE on macOS/BSD (Linux uses MSG_NOSIGNAL) */
+#ifdef SO_NOSIGPIPE
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+#endif
+
     /* Enable TCP quick ACK */
 #ifdef TCP_QUICKACK
     setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &opt, sizeof(opt));
@@ -226,47 +231,55 @@ int main(int argc, char *argv[]) {
                 int client_fd = fd;
 #endif
                 int close_conn = 0;
-                int requests_handled = 0;
 
-                /* Handle multiple pipelined requests in edge-triggered mode */
+                /* Read all available data in edge-triggered mode */
                 while (1) {
                     ssize_t count = recv(client_fd, buffer, sizeof(buffer), 0);
 
                     if (count == -1) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            /* No more data available, keep connection alive */
+                            /* No more data, keep connection alive */
                             break;
                         } else {
-                            /* Real error, close connection */
+                            /* Real error */
                             close_conn = 1;
                             break;
                         }
                     } else if (count == 0) {
-                        /* Client closed connection */
+                        /* Client closed */
                         close_conn = 1;
                         break;
                     }
 
-                    /* Parse HTTP request - look for end of headers */
-                    char *end_of_headers = NULL;
-                    for (ssize_t j = 0; j < count - 3; j++) {
-                        if (buffer[j] == '\r' && buffer[j+1] == '\n' &&
-                            buffer[j+2] == '\r' && buffer[j+3] == '\n') {
-                            end_of_headers = buffer + j + 4;
+                    /* Process all complete requests in this buffer */
+                    char *buf_ptr = buffer;
+                    ssize_t remaining = count;
+
+                    while (remaining > 0) {
+                        /* Look for end of HTTP headers */
+                        char *end_marker = NULL;
+                        for (ssize_t j = 0; j <= remaining - 4; j++) {
+                            if (buf_ptr[j] == '\r' && buf_ptr[j+1] == '\n' &&
+                                buf_ptr[j+2] == '\r' && buf_ptr[j+3] == '\n') {
+                                end_marker = buf_ptr + j + 4;
+                                break;
+                            }
+                        }
+
+                        if (!end_marker) {
+                            /* No complete request in buffer */
                             break;
                         }
-                    }
 
-                    if (end_of_headers) {
                         /* Send response */
-                        ssize_t total_sent = 0;
-                        while (total_sent < response_len) {
+                        ssize_t sent = 0;
+                        while (sent < response_len) {
 #ifdef USE_EPOLL
-                            ssize_t n = send(client_fd, response + total_sent,
-                                           response_len - total_sent, MSG_NOSIGNAL);
+                            ssize_t n = send(client_fd, response + sent,
+                                           response_len - sent, MSG_NOSIGNAL);
 #elif defined(USE_KQUEUE)
-                            ssize_t n = send(client_fd, response + total_sent,
-                                           response_len - total_sent, 0);
+                            ssize_t n = send(client_fd, response + sent,
+                                           response_len - sent, 0);
 #endif
                             if (n == -1) {
                                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -274,28 +287,17 @@ int main(int argc, char *argv[]) {
                                 }
                                 break;
                             }
-                            total_sent += n;
+                            sent += n;
                         }
 
-                        requests_handled++;
+                        if (close_conn) break;
 
-                        /* Check if there's more data after this request (pipelining) */
-                        ssize_t remaining = count - (end_of_headers - buffer);
-                        if (remaining > 0) {
-                            /* More data in buffer, might be next request */
-                            continue;
-                        }
-
-                        /* Continue to read more requests on this connection */
-                        if (!close_conn && requests_handled < 1000) {
-                            continue;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        /* Incomplete request, will get more data on next event */
-                        break;
+                        /* Move to next request in buffer (pipelining) */
+                        remaining -= (end_marker - buf_ptr);
+                        buf_ptr = end_marker;
                     }
+
+                    if (close_conn) break;
                 }
 
                 if (close_conn) {
