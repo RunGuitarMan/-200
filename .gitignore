@@ -6,6 +6,9 @@ server.exe
 *.o
 *.obj
 
+# Runtime files
+server.pid
+
 # Debug files
 *.dSYM/
 *.su

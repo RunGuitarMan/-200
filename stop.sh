@@ -16,8 +16,8 @@ if [ -f "$PID_FILE" ]; then
     rm -f "$PID_FILE"
     echo "Server stopped."
 else
-    echo "No PID file found. Trying pkill -f './server'..."
-    pkill -f '\./server'
+    echo "No PID file found. Trying pkill -x server..."
+    pkill -x server
     if [ $? -eq 0 ]; then
         echo "Server processes stopped."
     else

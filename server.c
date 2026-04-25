@@ -46,6 +46,7 @@ static long request_count;
 static long last_count;
 static char *response_data;
 static int response_len;
+static int date_offset;
 static const char *pid_file = "server.pid";
 
 /* --- Signal handler --- */
@@ -75,9 +76,12 @@ static void build_response(int body_size) {
         "\r\n", body_size, date);
 
     response_len = hlen + body_size;
-    response_data = malloc(response_len);
+    response_data = malloc((size_t)response_len);
     if (!response_data) { perror("malloc"); exit(1); }
     memcpy(response_data, header, hlen);
+
+    char *dp = strstr(response_data, "Date: ");
+    if (dp) date_offset = (int)(dp - response_data) + 6;
 
     if (body_size == 2)
         memcpy(response_data + hlen, "OK", 2);
@@ -181,8 +185,8 @@ static void accept_connections(int server_fd, int efd) {
         set_nonblocking(fd);
 #endif
         configure_socket(fd);
-        if (fd < MAX_FDS) conns[fd].len = 0;
-
+        if (fd >= MAX_FDS) { close(fd); continue; }
+        conns[fd].len = 0;
         if (ev_add(efd, fd) == -1) close(fd);
     }
 }
@@ -223,7 +227,7 @@ static void handle_client(int fd, int efd) {
         /* Process complete HTTP requests */
         int rem = total;
         while (rem >= 4) {
-            char *end = memmem(ptr, rem, "\r\n\r\n", 4);
+            char *end = memmem(ptr, (size_t)rem, "\r\n\r\n", 4);
             if (!end) break;
             end += 4;
 
@@ -231,7 +235,7 @@ static void handle_client(int fd, int efd) {
             ssize_t sent = 0;
             while (sent < response_len) {
                 ssize_t w = send(fd, response_data + sent,
-                                response_len - sent, SEND_FLAGS);
+                                (size_t)(response_len - sent), SEND_FLAGS);
                 if (w == -1) { close_conn = 1; break; }
                 sent += w;
             }
@@ -275,6 +279,13 @@ static void run_worker(int server_fd) {
         /* Periodic RPS report */
         time_t now = time(NULL);
         if (now != last_time) {
+            /* Refresh Date header in pre-built response */
+            struct tm tm;
+            char date[30];
+            gmtime_r(&now, &tm);
+            strftime(date, sizeof(date), "%a, %d %b %Y %H:%M:%S GMT", &tm);
+            memcpy(response_data + date_offset, date, 29);
+
             long cur = request_count;
             if (cur > last_count)
                 fprintf(stderr, "[pid %d] RPS: %ld  total: %ld\n",
@@ -412,7 +423,15 @@ int main(int argc, char *argv[]) {
 
         for (int i = 0; i < workers; i++) {
             pid_t pid = fork();
-            if (pid < 0) { perror("fork"); return 1; }
+            if (pid < 0) {
+                perror("fork");
+                for (int j = 0; j < i; j++) kill(pids[j], SIGTERM);
+                for (int j = 0; j < i; j++) waitpid(pids[j], NULL, 0);
+                remove_pid();
+                close(server_fd);
+                free(response_data);
+                return 1;
+            }
             if (pid == 0) {
                 run_worker(server_fd);
                 close(server_fd);
