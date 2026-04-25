@@ -1,318 +1,441 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
+#include <time.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
-/* Platform-specific event handling */
 #ifdef __linux__
     #include <sys/epoll.h>
-    #define USE_EPOLL 1
+    #define SEND_FLAGS MSG_NOSIGNAL
 #elif defined(__APPLE__) || defined(__FreeBSD__)
     #include <sys/event.h>
-    #define USE_KQUEUE 1
+    #define SEND_FLAGS 0
 #else
-    #error "Unsupported platform - need epoll (Linux) or kqueue (BSD/macOS)"
+    #error "Unsupported platform"
 #endif
 
-#define PORT 8080
+#define DEFAULT_PORT 8080
 #define BACKLOG 2048
 #define MAX_EVENTS 1024
 #define BUFFER_SIZE 4096
+#define CONN_BUF_SIZE 512
+#define MAX_FDS 65536
+#define MAX_BODY_SIZE (1024 * 1024)
 
-/* Pre-computed HTTP response with Keep-Alive */
-static const char response[] =
-    "HTTP/1.1 200 OK\r\n"
-    "Content-Length: 2\r\n"
-    "Connection: keep-alive\r\n"
-    "Keep-Alive: timeout=60, max=1000\r\n"
-    "\r\n"
-    "OK";
+/* --- Per-connection partial-read buffer --- */
 
-static const int response_len = sizeof(response) - 1;
+struct connection {
+    char buf[CONN_BUF_SIZE];
+    int len;
+};
 
-/* Set socket to non-blocking mode */
+static struct connection conns[MAX_FDS];
+
+/* --- Globals --- */
+
+static volatile sig_atomic_t running = 1;
+static long request_count;
+static long last_count;
+static char *response_data;
+static int response_len;
+static const char *pid_file = "server.pid";
+
+/* --- Signal handler --- */
+
+static void handle_shutdown(int sig) {
+    (void)sig;
+    running = 0;
+}
+
+/* --- Build pre-computed response --- */
+
+static void build_response(int body_size) {
+    char header[512];
+    time_t now = time(NULL);
+    struct tm tm;
+    char date[64];
+
+    gmtime_r(&now, &tm);
+    strftime(date, sizeof(date), "%a, %d %b %Y %H:%M:%S GMT", &tm);
+
+    int hlen = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: keep-alive\r\n"
+        "Keep-Alive: timeout=60, max=1000\r\n"
+        "Date: %s\r\n"
+        "\r\n", body_size, date);
+
+    response_len = hlen + body_size;
+    response_data = malloc(response_len);
+    if (!response_data) { perror("malloc"); exit(1); }
+    memcpy(response_data, header, hlen);
+
+    if (body_size == 2)
+        memcpy(response_data + hlen, "OK", 2);
+    else
+        memset(response_data + hlen, 'A', body_size);
+}
+
+/* --- Socket helpers --- */
+
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1) return -1;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-/* Configure socket for high performance */
 static void configure_socket(int fd) {
-    int opt = 1;
-
-    /* Disable Nagle's algorithm for lower latency */
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-
-    /* Increase buffer sizes */
-    int bufsize = 65536;
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
-
-    /* Prevent SIGPIPE on macOS/BSD (Linux uses MSG_NOSIGNAL) */
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 #ifdef SO_NOSIGPIPE
-    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
-
-    /* Enable TCP quick ACK */
 #ifdef TCP_QUICKACK
-    setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &opt, sizeof(opt));
+    setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
 #endif
 }
 
-int main(int argc, char *argv[]) {
-    int server_fd, event_fd;
-    struct sockaddr_in address;
-    int opt = 1;
-    int port = PORT;
+/* --- Event loop abstraction --- */
 
-    /* Allow custom port via argument */
-    if (argc > 1) {
-        port = atoi(argv[1]);
-        if (port <= 0 || port > 65535) {
-            fprintf(stderr, "Invalid port number. Using default: %d\n", PORT);
-            port = PORT;
-        }
-    }
-
-    /* Create server socket */
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
-    }
-
-    /* Set socket options */
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        perror("setsockopt SO_REUSEADDR");
-        exit(EXIT_FAILURE);
-    }
-
-#ifdef SO_REUSEPORT
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt))) {
-        perror("setsockopt SO_REUSEPORT");
-        exit(EXIT_FAILURE);
-    }
+#ifdef __linux__
+typedef struct epoll_event ev_t;
+#else
+typedef struct kevent ev_t;
 #endif
 
-    /* Set non-blocking */
-    if (set_nonblocking(server_fd) == -1) {
-        perror("set_nonblocking");
-        exit(EXIT_FAILURE);
-    }
-
-    /* Bind */
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port);
-
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
-
-    /* Listen with larger backlog */
-    if (listen(server_fd, BACKLOG) < 0) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
-
-#ifdef USE_EPOLL
-    /* Create epoll instance */
-    struct epoll_event ev, events[MAX_EVENTS];
-    event_fd = epoll_create1(0);
-    if (event_fd == -1) {
-        perror("epoll_create1");
-        exit(EXIT_FAILURE);
-    }
-
-    /* Add server socket to epoll */
-    ev.events = EPOLLIN | EPOLLET;
-    ev.data.fd = server_fd;
-    if (epoll_ctl(event_fd, EPOLL_CTL_ADD, server_fd, &ev) == -1) {
-        perror("epoll_ctl: server_fd");
-        exit(EXIT_FAILURE);
-    }
-
-    printf("High-performance web server listening on port %d\n", port);
-    printf("Using epoll (Linux)\n");
-
-#elif defined(USE_KQUEUE)
-    /* Create kqueue instance */
-    struct kevent events[MAX_EVENTS];
-    struct kevent change;
-    event_fd = kqueue();
-    if (event_fd == -1) {
-        perror("kqueue");
-        exit(EXIT_FAILURE);
-    }
-
-    /* Add server socket to kqueue */
-    EV_SET(&change, server_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
-    if (kevent(event_fd, &change, 1, NULL, 0, NULL) == -1) {
-        perror("kevent: server_fd");
-        exit(EXIT_FAILURE);
-    }
-
-    printf("High-performance web server listening on port %d\n", port);
-    printf("Using kqueue (macOS/BSD)\n");
+static inline int ev_init(void) {
+#ifdef __linux__
+    return epoll_create1(0);
+#else
+    return kqueue();
 #endif
+}
 
-    printf("Press Ctrl+C to stop\n");
+static inline int ev_add(int efd, int fd) {
+#ifdef __linux__
+    struct epoll_event ev = { .events = EPOLLIN | EPOLLET, .data.fd = fd };
+    return epoll_ctl(efd, EPOLL_CTL_ADD, fd, &ev);
+#else
+    struct kevent kev;
+    EV_SET(&kev, fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    return kevent(efd, &kev, 1, NULL, 0, NULL);
+#endif
+}
 
-    /* Event loop */
-    char buffer[BUFFER_SIZE];
+static inline int ev_del(int efd, int fd) {
+#ifdef __linux__
+    return epoll_ctl(efd, EPOLL_CTL_DEL, fd, NULL);
+#else
+    struct kevent kev;
+    EV_SET(&kev, fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    return kevent(efd, &kev, 1, NULL, 0, NULL);
+#endif
+}
+
+static inline int ev_wait(int efd, ev_t *events, int max) {
+#ifdef __linux__
+    return epoll_wait(efd, events, max, 1000);
+#else
+    struct timespec ts = {1, 0};
+    return kevent(efd, NULL, 0, events, max, &ts);
+#endif
+}
+
+static inline int ev_fd(ev_t *e) {
+#ifdef __linux__
+    return e->data.fd;
+#else
+    return (int)e->ident;
+#endif
+}
+
+/* --- Accept connections --- */
+
+static void accept_connections(int server_fd, int efd) {
     while (1) {
-#ifdef USE_EPOLL
-        int nfds = epoll_wait(event_fd, events, MAX_EVENTS, -1);
-        if (nfds == -1) {
-            perror("epoll_wait");
-            exit(EXIT_FAILURE);
+        struct sockaddr_in addr;
+        socklen_t addrlen = sizeof(addr);
+        int fd;
+
+#ifdef __linux__
+        fd = accept4(server_fd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
+#else
+        fd = accept(server_fd, (struct sockaddr *)&addr, &addrlen);
+#endif
+        if (fd == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            perror("accept");
+            break;
         }
 
-        for (int i = 0; i < nfds; i++) {
-            if (events[i].data.fd == server_fd) {
-#elif defined(USE_KQUEUE)
-        int nfds = kevent(event_fd, NULL, 0, events, MAX_EVENTS, NULL);
-        if (nfds == -1) {
-            perror("kevent");
-            exit(EXIT_FAILURE);
+#ifndef __linux__
+        set_nonblocking(fd);
+#endif
+        configure_socket(fd);
+        if (fd < MAX_FDS) conns[fd].len = 0;
+
+        if (ev_add(efd, fd) == -1) close(fd);
+    }
+}
+
+/* --- Handle client data --- */
+
+static void handle_client(int fd, int efd) {
+    if (fd >= MAX_FDS) { ev_del(efd, fd); close(fd); return; }
+
+    struct connection *c = &conns[fd];
+    int close_conn = 0;
+    char recv_buf[BUFFER_SIZE];
+
+    while (1) {
+        ssize_t n = recv(fd, recv_buf, sizeof(recv_buf), 0);
+        if (n == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            close_conn = 1; break;
+        }
+        if (n == 0) { close_conn = 1; break; }
+
+        /* Combine with leftover from previous recv */
+        char *ptr;
+        int total;
+        char combined[BUFFER_SIZE + CONN_BUF_SIZE];
+
+        if (c->len > 0) {
+            memcpy(combined, c->buf, c->len);
+            memcpy(combined + c->len, recv_buf, n);
+            ptr = combined;
+            total = c->len + (int)n;
+            c->len = 0;
+        } else {
+            ptr = recv_buf;
+            total = (int)n;
         }
 
-        for (int i = 0; i < nfds; i++) {
-            int fd = (int)events[i].ident;
-            if (fd == server_fd) {
-#endif
-                /* Accept new connections */
-                while (1) {
-                    struct sockaddr_in client_addr;
-                    socklen_t client_len = sizeof(client_addr);
-                    int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        /* Process complete HTTP requests */
+        int rem = total;
+        while (rem >= 4) {
+            char *end = memmem(ptr, rem, "\r\n\r\n", 4);
+            if (!end) break;
+            end += 4;
 
-                    if (client_fd == -1) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            break;
-                        } else {
-                            perror("accept");
-                            break;
-                        }
-                    }
+            /* Send response; close on partial send to prevent stream corruption */
+            ssize_t sent = 0;
+            while (sent < response_len) {
+                ssize_t w = send(fd, response_data + sent,
+                                response_len - sent, SEND_FLAGS);
+                if (w == -1) { close_conn = 1; break; }
+                sent += w;
+            }
+            if (sent < response_len) { close_conn = 1; break; }
 
-                    /* Configure client socket */
-                    set_nonblocking(client_fd);
-                    configure_socket(client_fd);
+            request_count++;
+            rem -= (int)(end - ptr);
+            ptr = end;
+        }
+        if (close_conn) break;
 
-#ifdef USE_EPOLL
-                    /* Add to epoll */
-                    ev.events = EPOLLIN | EPOLLET;
-                    ev.data.fd = client_fd;
-                    if (epoll_ctl(event_fd, EPOLL_CTL_ADD, client_fd, &ev) == -1) {
-                        perror("epoll_ctl: client_fd");
-                        close(client_fd);
-                    }
-#elif defined(USE_KQUEUE)
-                    /* Add to kqueue */
-                    EV_SET(&change, client_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
-                    if (kevent(event_fd, &change, 1, NULL, 0, NULL) == -1) {
-                        perror("kevent: client_fd");
-                        close(client_fd);
-                    }
-#endif
-                }
+        /* Save leftover partial header data */
+        if (rem > 0) {
+            if (rem <= CONN_BUF_SIZE) {
+                memcpy(c->buf, ptr, rem);
+                c->len = rem;
             } else {
-                /* Handle client data */
-#ifdef USE_EPOLL
-                int client_fd = events[i].data.fd;
-#elif defined(USE_KQUEUE)
-                int client_fd = fd;
-#endif
-                int close_conn = 0;
-
-                /* Read all available data in edge-triggered mode */
-                while (1) {
-                    ssize_t count = recv(client_fd, buffer, sizeof(buffer), 0);
-
-                    if (count == -1) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            /* No more data, keep connection alive */
-                            break;
-                        } else {
-                            /* Real error */
-                            close_conn = 1;
-                            break;
-                        }
-                    } else if (count == 0) {
-                        /* Client closed */
-                        close_conn = 1;
-                        break;
-                    }
-
-                    /* Process all complete requests in this buffer */
-                    char *buf_ptr = buffer;
-                    ssize_t remaining = count;
-
-                    while (remaining > 0) {
-                        /* Look for end of HTTP headers */
-                        char *end_marker = NULL;
-                        for (ssize_t j = 0; j <= remaining - 4; j++) {
-                            if (buf_ptr[j] == '\r' && buf_ptr[j+1] == '\n' &&
-                                buf_ptr[j+2] == '\r' && buf_ptr[j+3] == '\n') {
-                                end_marker = buf_ptr + j + 4;
-                                break;
-                            }
-                        }
-
-                        if (!end_marker) {
-                            /* No complete request in buffer */
-                            break;
-                        }
-
-                        /* Send response */
-                        ssize_t sent = 0;
-                        while (sent < response_len) {
-#ifdef USE_EPOLL
-                            ssize_t n = send(client_fd, response + sent,
-                                           response_len - sent, MSG_NOSIGNAL);
-#elif defined(USE_KQUEUE)
-                            ssize_t n = send(client_fd, response + sent,
-                                           response_len - sent, 0);
-#endif
-                            if (n == -1) {
-                                if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                                    close_conn = 1;
-                                }
-                                break;
-                            }
-                            sent += n;
-                        }
-
-                        if (close_conn) break;
-
-                        /* Move to next request in buffer (pipelining) */
-                        remaining -= (end_marker - buf_ptr);
-                        buf_ptr = end_marker;
-                    }
-
-                    if (close_conn) break;
-                }
-
-                if (close_conn) {
-#ifdef USE_EPOLL
-                    epoll_ctl(event_fd, EPOLL_CTL_DEL, client_fd, NULL);
-#elif defined(USE_KQUEUE)
-                    EV_SET(&change, client_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-                    kevent(event_fd, &change, 1, NULL, 0, NULL);
-#endif
-                    close(client_fd);
-                }
+                close_conn = 1; break;
             }
         }
     }
 
+    if (close_conn) {
+        ev_del(efd, fd);
+        close(fd);
+        c->len = 0;
+    }
+}
+
+/* --- Worker event loop --- */
+
+static void run_worker(int server_fd) {
+    int efd = ev_init();
+    if (efd == -1) { perror("ev_init"); exit(1); }
+    if (ev_add(efd, server_fd) == -1) { perror("ev_add"); exit(1); }
+
+    ev_t events[MAX_EVENTS];
+    time_t last_time = time(NULL);
+
+    while (running) {
+        /* Periodic RPS report */
+        time_t now = time(NULL);
+        if (now != last_time) {
+            long cur = request_count;
+            if (cur > last_count)
+                fprintf(stderr, "[pid %d] RPS: %ld  total: %ld\n",
+                        getpid(), cur - last_count, cur);
+            last_count = cur;
+            last_time = now;
+        }
+
+        int nfds = ev_wait(efd, events, MAX_EVENTS);
+        if (nfds == -1) {
+            if (errno == EINTR) continue;
+            perror("ev_wait");
+            break;
+        }
+
+        for (int i = 0; i < nfds; i++) {
+            int fd = ev_fd(&events[i]);
+            if (fd == server_fd)
+                accept_connections(server_fd, efd);
+            else
+                handle_client(fd, efd);
+        }
+    }
+
+    close(efd);
+}
+
+/* --- PID file --- */
+
+static void write_pid(void) {
+    FILE *f = fopen(pid_file, "w");
+    if (f) { fprintf(f, "%d\n", getpid()); fclose(f); }
+}
+
+static void remove_pid(void) { unlink(pid_file); }
+
+/* --- Usage --- */
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: %s [-p PORT] [-w WORKERS] [-s BODY_SIZE] [PORT]\n"
+        "  -p PORT       Listen port (default: %d)\n"
+        "  -w WORKERS    Number of worker processes (default: 1)\n"
+        "  -s SIZE       Response body size in bytes (default: 2)\n",
+        prog, DEFAULT_PORT);
+    exit(1);
+}
+
+/* --- Main --- */
+
+int main(int argc, char *argv[]) {
+    int port = DEFAULT_PORT, workers = 1, body_size = 2;
+    int ch;
+
+    while ((ch = getopt(argc, argv, "p:w:s:h")) != -1) {
+        char *endp;
+        long val;
+        switch (ch) {
+        case 'p':
+            val = strtol(optarg, &endp, 10);
+            if (*endp || val <= 0 || val > 65535)
+                { fprintf(stderr, "Bad port: %s\n", optarg); return 1; }
+            port = (int)val;
+            break;
+        case 'w':
+            val = strtol(optarg, &endp, 10);
+            if (*endp || val <= 0 || val > 1024)
+                { fprintf(stderr, "Bad workers: %s\n", optarg); return 1; }
+            workers = (int)val;
+            break;
+        case 's':
+            val = strtol(optarg, &endp, 10);
+            if (*endp || val <= 0 || val > MAX_BODY_SIZE)
+                { fprintf(stderr, "Bad size: %s\n", optarg); return 1; }
+            body_size = (int)val;
+            break;
+        default: usage(argv[0]);
+        }
+    }
+
+    /* Legacy positional port argument */
+    if (optind < argc && port == DEFAULT_PORT) {
+        char *endp;
+        long val = strtol(argv[optind], &endp, 10);
+        if (*endp == '\0' && val > 0 && val <= 65535)
+            port = (int)val;
+    }
+
+    build_response(body_size);
+
+    /* Create server socket */
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) { perror("socket"); return 1; }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
+#ifdef TCP_FASTOPEN
+    int qlen = 5;
+    setsockopt(server_fd, IPPROTO_TCP, TCP_FASTOPEN, &qlen, sizeof(qlen));
+#endif
+
+    set_nonblocking(server_fd);
+
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = INADDR_ANY,
+        .sin_port = htons(port)
+    };
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+        { perror("bind"); return 1; }
+    if (listen(server_fd, BACKLOG) < 0)
+        { perror("listen"); return 1; }
+
+    printf("HTTP server on port %d", port);
+#ifdef __linux__
+    printf(" [epoll]");
+#else
+    printf(" [kqueue]");
+#endif
+    printf("  workers=%d  body=%dB\n", workers, body_size);
+
+    /* Signals */
+    struct sigaction sa = { .sa_handler = handle_shutdown };
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+
+    if (workers > 1) {
+        pid_t pids[1024];
+        write_pid();
+
+        for (int i = 0; i < workers; i++) {
+            pid_t pid = fork();
+            if (pid < 0) { perror("fork"); return 1; }
+            if (pid == 0) {
+                run_worker(server_fd);
+                close(server_fd);
+                free(response_data);
+                _exit(0);
+            }
+            pids[i] = pid;
+            printf("  worker %d: pid %d\n", i + 1, pid);
+        }
+
+        while (running) sleep(1);
+        printf("\nShutting down %d workers...\n", workers);
+        for (int i = 0; i < workers; i++) kill(pids[i], SIGTERM);
+        for (int i = 0; i < workers; i++) waitpid(pids[i], NULL, 0);
+        remove_pid();
+    } else {
+        write_pid();
+        run_worker(server_fd);
+        remove_pid();
+    }
+
     close(server_fd);
+    free(response_data);
+    printf("Server stopped.\n");
     return 0;
 }

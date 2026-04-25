@@ -1,25 +1,17 @@
 #!/bin/bash
 
-# Компиляция
-echo "Компиляция сервера..."
-clang -O3 -march=native -o server server.c
+# Build using Makefile
+echo "Building server..."
+make -s
 
-# Увеличение лимитов
-echo "Настройка системных лимитов..."
+# Increase file descriptor limit
+echo "Setting system limits..."
 ulimit -n 12288
 
-# Определение количества ядер
-CORES=$(sysctl -n hw.ncpu)
-echo "Обнаружено ядер: $CORES"
+# Detect CPU cores
+CORES=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+echo "Detected $CORES cores"
 
-# Запуск процессов
-echo "Запуск $CORES экземпляров сервера..."
-for i in $(seq 1 $CORES); do
-    ./server &
-done
-
-echo "Серверы запущены. PID процессов:"
-pgrep server
-
-echo ""
-echo "Для остановки используйте: pkill server"
+# Start server with multi-worker mode
+echo "Starting server with $CORES workers..."
+./server -w "$CORES"
