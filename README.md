@@ -87,14 +87,16 @@ make && ./server -w 2    # пиковая конфигурация: ~450K RPS
 Максимальная производительность (Apple M3 Pro): **451K RPS**.
 Подробные результаты и анализ: **[BENCHMARK.md](BENCHMARK.md)**
 
+Рекомендуется использовать **wrk** — он написан на C с нативным event loop и поддерживает HTTP pipelining (отправляет пачки запросов не дожидаясь ответов). `hey` использует Go `net/http`, который не поддерживает pipelining и добавляет overhead на goroutine scheduling — в наших тестах это даёт потолок ~220K RPS против ~450K у wrk при том же сервере.
+
 ```bash
 # Оптимальный запуск (пиковый RPS)
 ./server -w 2
 
-# Нагрузка (wrk)
+# Нагрузка (wrk, рекомендуется)
 wrk -t3 -c600 -d15s http://localhost:8080/
 
-# Нагрузка (hey)
+# Нагрузка (hey, ~2x медленнее из-за отсутствия pipelining)
 hey -c 400 -z 10s http://localhost:8080/
 
 # Apache Bench
